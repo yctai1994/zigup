@@ -3,6 +3,41 @@ const Io = std.Io;
 
 const zigup = @import("zigup");
 
+/// Returns owned response bytes that remain valid after this function returns.
+/// The caller frees them with allocator.free; the allocator's backing storage
+/// must remain valid until then. Borrows io and environ for this call.
+pub fn fetchIndex(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+) ![]u8 {
+    // Local arena bookkeeping owns allocator-backed proxy objects, hostnames,
+    // and optional authentication strings when proxy settings are present.
+    var proxy_arena = std.heap.ArenaAllocator.init(allocator);
+    defer proxy_arena.deinit();
+
+    // The local client owns allocator-backed connection/request resources and
+    // borrows proxy data from proxy_arena. Defers run in reverse order, so the
+    // client is destroyed before the arena releases the borrowed proxy data.
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    try client.initDefaultProxies(proxy_arena.allocator(), environ);
+
+    // First use of a buffered HTTP response; revisit reuse at a second occurrence.
+    // This local writer owns a separate allocator-backed byte buffer.
+    // On failure, deinit releases any bytes still owned by the writer.
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    defer body.deinit();
+    const result = try client.fetch(.{
+        .location = .{ .url = "https://ziglang.org/download/index.json" },
+        .response_writer = &body.writer,
+    });
+    if (result.status != .ok) return error.UnexpectedHttpStatus;
+    // On success, transfer the buffer to the caller and empty the writer.
+    // The deferred body.deinit() leaves the returned bytes valid.
+    return body.toOwnedSlice();
+}
+
 pub fn main(init: std.process.Init) !void {
     // Prints to stderr, unbuffered, ignoring potential errors.
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
